@@ -13,7 +13,7 @@ namespace duckdb {
 // Maximum number of hash functions used in the bloom-filter.
 static size_t MAX_HASH_FUNCTIONS = 2;
 // Maximum size of the bloom-filter in bits. Set to 0 for unbounded.
-static size_t MAX_BF_SIZE_BITS = 0;
+static size_t MAX_BF_SIZE_BITS = 4 * (1u << 20);
 // Whether to use a fixed-size bloom-filter.
 static bool USE_BABY_BLOOM = false;
 // Whether the bloom-filter should have a power-of-two size. If yes, indexing can be done fast with a bitmap. Otherwise, fast-mod is used.
