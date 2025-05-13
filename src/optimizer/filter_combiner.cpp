@@ -19,6 +19,8 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/common/operator/subtract.hpp"
 
+#include <iostream>
+
 namespace duckdb {
 
 using ExpressionValueInformation = FilterCombiner::ExpressionValueInformation;
@@ -649,6 +651,7 @@ TableFilterSet FilterCombiner::GenerateTableScanFilters(const vector<ColumnIndex
 				remaining_filters.erase_at(rem_fil_idx--); // decrement to stay on the same idx next iteration
 			} else {
 				// if this is not a dense range we can push a zone-map filter
+				// NOTE: That's how it ends like an optional filter.
 				auto optional_filter = make_uniq<OptionalFilter>();
 				auto in_filter = make_uniq<InFilter>(std::move(in_list));
 				optional_filter->child_filter = std::move(in_filter);

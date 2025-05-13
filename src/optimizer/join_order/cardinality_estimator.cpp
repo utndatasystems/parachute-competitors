@@ -9,6 +9,8 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/storage/data_table.hpp"
 
+#include <iostream>
+
 namespace duckdb {
 
 // The filter was made on top of a logical sample or other projection,
@@ -69,7 +71,7 @@ vector<idx_t> CardinalityEstimator::DetermineMatchingEquivalentSets(optional_ptr
 }
 
 void CardinalityEstimator::AddToEquivalenceSets(optional_ptr<FilterInfo> filter_info,
-                                                vector<idx_t> matching_equivalent_sets) {
+                                                vector<idx_t> matching_equivalent_sets) {							
 	D_ASSERT(matching_equivalent_sets.size() <= 2);
 	if (matching_equivalent_sets.size() > 1) {
 		// an equivalence relation is connecting two sets of equivalence relations
@@ -103,6 +105,7 @@ void CardinalityEstimator::InitEquivalentRelations(const vector<unique_ptr<Filte
 	// For each filter, we fill keep track of the index of the equivalent relation set
 	// the left and right relation needs to be added to.
 	for (auto &filter : filter_infos) {
+		// std::cerr << "\t[InitEquivalentRelations]" << filter->filter->ToString() << std::endl;
 		if (SingleColumnFilter(*filter)) {
 			// Filter on one relation, (i.e. string or range filter on a column).
 			// Grab the first relation and add it to  the equivalence_relations
@@ -379,7 +382,7 @@ DenomInfo CardinalityEstimator::GetDenominator(JoinRelationSet &set) {
 
 template <>
 double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set) {
-
+	
 	if (relation_set_2_cardinality.find(new_set.ToString()) != relation_set_2_cardinality.end()) {
 		return relation_set_2_cardinality[new_set.ToString()].cardinality_before_filters;
 	}
@@ -427,6 +430,8 @@ void CardinalityEstimator::InitCardinalityEstimatorProps(optional_ptr<JoinRelati
 
 	UpdateTotalDomains(set, stats);
 
+	// PrintRelationToTdomInfo();
+
 	// sort relations from greatest tdom to lowest tdom.
 	std::sort(relations_to_tdoms.begin(), relations_to_tdoms.end(), SortTdoms);
 }
@@ -441,6 +446,7 @@ void CardinalityEstimator::UpdateTotalDomains(optional_ptr<JoinRelationSet> set,
 		//! for every column used in a filter in the relation, get the distinct count via HLL, or assume it to be
 		//! the cardinality
 		// Update the relation_to_tdom set with the estimated distinct count (or tdom) calculated above
+		// TODO: Where above?
 		auto key = ColumnBinding(relation_id, i);
 		for (auto &relation_to_tdom : relations_to_tdoms) {
 			column_binding_set_t i_set = relation_to_tdom.equivalent_relations;
@@ -448,6 +454,11 @@ void CardinalityEstimator::UpdateTotalDomains(optional_ptr<JoinRelationSet> set,
 				continue;
 			}
 			auto distinct_count = stats.column_distinct_count.at(i);
+
+			// std::cerr << "[UpdateTotalDomains] inside here" << std::endl;
+			// auto column_name = stats.column_names.at(i);
+			// std::cerr << "\tcolumn_name=" << column_name << std::endl;
+
 			if (distinct_count.from_hll && relation_to_tdom.has_tdom_hll) {
 				relation_to_tdom.tdom_hll = MaxValue(relation_to_tdom.tdom_hll, distinct_count.distinct_count);
 			} else if (distinct_count.from_hll && !relation_to_tdom.has_tdom_hll) {
