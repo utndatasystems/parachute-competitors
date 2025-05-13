@@ -30,6 +30,7 @@
 #include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include <fstream>
 
 namespace duckdb {
 
@@ -1099,6 +1100,162 @@ bool OrderedAggregateThresholdSetting::OnLocalSet(ClientContext &context, const 
 		throw ParserException("Invalid option for PRAGMA ordered_aggregate_threshold, value must be positive");
 	}
 	return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Parachute Cardinality Estimates Input File
+//===----------------------------------------------------------------------===//
+ParachuteStats::ParachuteStats(std::string input_file, char delimiter) {
+	// No input file? Then clear.
+	if (input_file.empty()) {
+		data.clear();
+		return;
+	}
+
+	// Corner case. We don't want to read the parachute stats, but just make sure that the default optimizer is enabled.
+	// This means that we don't skip the parachute columns from the scan.
+	if (input_file == "fake") {
+		data.clear();
+		return;
+	}
+
+	std::ifstream in(input_file);
+	assert(in.is_open());
+
+	auto trim_newline = [&](std::string &str) {
+		if (!str.empty() && str.back() == '\n') {
+			str.pop_back();
+		}
+	};
+
+	std::string line;
+	while (std::getline(in, line)) {
+		std::istringstream ss(line);
+		std::string field;
+
+		// Trim newline.
+		trim_newline(line);
+		if (line.empty()) {
+			return;
+		}
+
+		unsigned field_index = 0;
+		idx_t curr_num_bins, curr_bin_idx, curr_card;
+		std::string curr_table_name, curr_col_name;
+		while (std::getline(ss, field, delimiter)) {
+			if (field_index == 0) {
+				curr_num_bins = std::stoull(field);
+			} else if (field_index == 1) {
+				curr_table_name = field;
+			} else if (field_index == 2) {
+				curr_col_name = field;
+			} else if (field_index == 3) {
+				curr_bin_idx = std::stoull(field);
+			} else if (field_index == 4) {
+				curr_card = std::stoull(field);
+			}
+			++field_index;
+		}
+
+		// Resize to be sure we have enough.
+		assert (field_index == 5);
+		assert (curr_bin_idx < curr_num_bins);
+		data[curr_table_name][curr_col_name].push_back({curr_bin_idx, curr_card});
+	}
+
+	// for (auto& [tn, _] : data) {
+	// 	std::cerr << "\ntn=" << tn << std::endl;
+	// 	for (auto& [cn, _] : data[tn]) {
+	// 		std::cerr << "cn=" << cn << std::endl;
+	// 		for (unsigned index = 0, limit = data[tn][cn].size(); index != limit; ++index) {
+	// 			std::cerr << "index=" << index << " val: " << data[tn][cn][index] << std::endl;
+	// 		}
+	// 	}
+	// }
+}
+
+bool ParachuteStats::empty() const {
+	return data.empty();
+}
+
+bool ParachuteStats::has(std::string tn, std::string cn) const {
+	if (data.find(tn) == data.end())
+		return false;
+	if (data.at(tn).find(cn) == data.at(tn).end())
+		return false;
+	return true;
+}
+
+idx_t ParachuteStats::compute_full_card(std::string tn, std::string cn) const {
+	auto infty = std::numeric_limits<idx_t>::max();
+	return compute_range_card(tn, cn, 0, infty);
+}
+
+idx_t ParachuteStats::compute_range_card(std::string tn, std::string cn, idx_t lb, idx_t ub) const {
+	assert(has(tn, cn));
+	idx_t range_card = 0;
+	for (auto elem : data.at(tn).at(cn)) {
+		if ((lb <= elem.first) && (elem.first < ub)) {
+			range_card += elem.second;
+		}
+	}
+	return range_card;
+}
+
+double ParachuteStats::compute_selectivity(std::string tn, std::string cn, std::string op, idx_t bin_idx) const {
+	assert(has(tn, cn));
+
+	auto infty = std::numeric_limits<idx_t>::max();
+	auto full_range_card = compute_full_card(tn, cn);
+
+	std::cerr << "\t[compute_selectivity] ful_range_card=" << full_range_card << std::endl;
+
+	if (op == "=") {
+		return 1.0 * compute_range_card(tn, cn, bin_idx, bin_idx + 1) / full_range_card;
+	} else if (op == "!=") {
+		return 1.0 * (compute_range_card(tn, cn, bin_idx, bin_idx) + compute_range_card(tn, cn, bin_idx + 1, infty)) / full_range_card;	
+	} else if (op == "<") {
+		return 1.0 * compute_range_card(tn, cn, 0, bin_idx) / full_range_card;		
+	} else if (op == "<=") {
+		return 1.0 * compute_range_card(tn, cn, 0, bin_idx + 1) / full_range_card;			
+	} else if (op == ">") {
+		return 1.0 * compute_range_card(tn, cn, bin_idx + 1, infty) / full_range_card;			
+	} else if (op == ">=") {
+		return 1.0 * compute_range_card(tn, cn, bin_idx, infty) / full_range_card;				
+	}
+	// std::cerr << "[compute_selectivity] We didn't find " << op << " in our cases!" << std::endl;
+	assert(0);
+	return 0.0;
+}
+
+double ParachuteStats::compute_mask_selectivity(std::string tn, std::string cn, idx_t bit_mask) const {
+	assert(has(tn, cn));
+
+	auto full_range_card = compute_full_card(tn, cn);
+	auto card = 0;
+	for (auto elem : data.at(tn).at(cn)) {
+		if ((elem.first & bit_mask) == bit_mask) {
+			card += elem.second;
+		}
+	}
+	return 1.0 * card / full_range_card;
+}
+
+void ParachuteStatsSetting::SetLocal(ClientContext &context, const Value &input) {
+	auto &config = ClientConfig::GetConfig(context);
+	auto parameter = input.ToString();
+	config.parachute_stats_file = parameter;
+	config.parachute_stats = ParachuteStats(config.parachute_stats_file);
+}
+
+void ParachuteStatsSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).parachute_stats_file = ClientConfig().parachute_stats_file;
+	ClientConfig::GetConfig(context).parachute_stats = ParachuteStats(ClientConfig::GetConfig(context).parachute_stats_file);
+}
+
+Value ParachuteStatsSetting::GetSetting(const ClientContext &context) {
+	auto &config = ClientConfig::GetConfig(context);
+	return Value(config.parachute_stats_file);
 }
 
 //===----------------------------------------------------------------------===//

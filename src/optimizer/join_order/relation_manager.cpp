@@ -10,6 +10,9 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/list.hpp"
 
+#include <iostream>
+#include <regex>
+
 namespace duckdb {
 
 const vector<RelationStats> RelationManager::GetRelationStats() {
@@ -185,12 +188,209 @@ static void ModifyStatsIfLimit(optional_ptr<LogicalOperator> limit_op, RelationS
 	}
 }
 
+bool starts_with3(std::string text, std::string pattern) {
+	int text_len = text.size();
+	int pattern_len = pattern.size();
+	if (text_len < pattern_len) return false;
+	return text.compare(0, pattern_len, pattern) == 0;
+}
+
+// Base class for all AST nodes
+class MyExprNode {
+public:
+    virtual ~MyExprNode() = default;
+    virtual double evaluate(const std::string& table_name, const ParachuteStats& parachute_stats) const = 0;
+    virtual std::string to_string() const = 0;
+    virtual std::unordered_set<std::string> unique_cols() const = 0;
+};
+
+// Predicate Node (Leaf node)
+class PredicateNode : public MyExprNode {
+    std::string left;
+    std::string op;
+    int right;
+
+public:
+    PredicateNode(std::string l, std::string o, int r) : left(std::move(l)), op(std::move(o)), right(r) {}
+
+    double evaluate(const std::string& table_name, const ParachuteStats& parachute_stats) const override {
+        if (op == "=") {
+					return parachute_stats.compute_selectivity(table_name, left, op, right);
+				}
+        if (op == "&") {
+					return parachute_stats.compute_mask_selectivity(table_name, left, right);				
+				}
+        D_ASSERT(0);
+				return 0.0;
+    }
+
+    std::unordered_set<std::string> unique_cols() const override {
+        return {left};
+    }
+
+    std::string to_string() const override {
+        return "(" + left + " " + op + " " + std::to_string(right) + ")";
+    }
+};
+
+// Logical AND Node
+class MyAndNode : public MyExprNode {
+    std::unique_ptr<MyExprNode> left, right;
+
+public:
+    MyAndNode(std::unique_ptr<MyExprNode> l, std::unique_ptr<MyExprNode> r) : left(std::move(l)), right(std::move(r)) {}
+    double evaluate(const std::string& table_name, const ParachuteStats& parachute_stats) const override {
+        return std::min(left->evaluate(table_name, parachute_stats), right->evaluate(table_name, parachute_stats));
+    }
+    std::unordered_set<std::string> unique_cols() const override {
+        auto set1 = left->unique_cols();
+        auto set2 = right->unique_cols();
+        set1.insert(set2.begin(), set2.end());
+        return set1;
+    }
+    std::string to_string() const override {
+        return "(" + left->to_string() + " AND " + right->to_string() + ")";
+    }
+};
+
+// Logical OR Node
+class MyOrNode : public MyExprNode {
+    std::unique_ptr<MyExprNode> left, right;
+
+public:
+    MyOrNode(std::unique_ptr<MyExprNode> l, std::unique_ptr<MyExprNode> r) : left(std::move(l)), right(std::move(r)) {}
+    double evaluate(const std::string& table_name, const ParachuteStats& parachute_stats) const override {
+        // Check for unique cols, like in `IN`.
+        // NOTE: Is not entirely correct, but works for IN.
+        auto cols = unique_cols();
+        if (cols.size() == 1) 
+            return left->evaluate(table_name, parachute_stats) + right->evaluate(table_name, parachute_stats);
+        return std::max(left->evaluate(table_name, parachute_stats), right->evaluate(table_name, parachute_stats));
+    }
+    std::string to_string() const override {
+        return "(" + left->to_string() + " OR " + right->to_string() + ")";
+    }
+    std::unordered_set<std::string> unique_cols() const override {
+        auto set1 = left->unique_cols();
+        auto set2 = right->unique_cols();
+        set1.insert(set2.begin(), set2.end());
+        return set1;
+    }
+};
+
+// Tokenizer function to handle multi-character operators and spacing
+std::vector<std::string> my_tokenizer(const std::string& expr) {
+    std::vector<std::string> tokens;
+    std::string token;
+    for (size_t i = 0; i < expr.size(); ++i) {
+        char c = expr[i];
+        if (std::isspace(c)) continue;
+        if (c == '(' || c == ')') {
+            tokens.emplace_back(1, c);
+        } else if (c == '&' || c == '=') {
+            tokens.emplace_back(1, c);
+        } else {
+            size_t j = i;
+            while (j < expr.size() && (std::isalnum(expr[j]) || expr[j] == '_')) ++j;
+            tokens.emplace_back(expr.substr(i, j - i));
+            i = j - 1;
+        }
+    }
+    return tokens;
+}
+
+// Parser for boolean expressions
+std::unique_ptr<MyExprNode> my_expression_parser(const std::string& expr) {
+    std::vector<std::string> tokens = my_tokenizer(expr);
+    std::vector<std::unique_ptr<MyExprNode>> values;
+    std::vector<std::string> ops;
+
+    // auto debug_ops=[&](std::vector<std::string>& vs, const char*msg) {
+    //     std::cerr << msg << "(" << vs.size() << "): ";
+    //     for (auto v: vs) {
+    //         std::cerr << v << " ";
+    //     }
+    //     std::cerr << std::endl;
+    // };
+    // auto debug_values=[&](std::vector<std::unique_ptr<MyExprNode>>& vs, const char*msg) {
+    //     std::cerr << msg << "(" << vs.size() << "): ";
+    //     for (auto& v: vs) {
+    //         std::cerr << v->to_string() << " ";
+    //     }
+    //     std::cerr << std::endl << std::endl;;
+    // };
+
+    auto applyOperator = [&]() {
+        if (ops.empty() || values.size() < 2) {
+           return;
+        }
+        std::string op = ops.back(); ops.pop_back();
+        auto right = std::move(values.back()); values.pop_back();
+        auto left = std::move(values.back()); values.pop_back();
+
+        if (op == "AND") {
+            values.push_back(make_uniq<MyAndNode>(std::move(left), std::move(right)));
+        } else if (op == "OR") {
+            values.push_back(make_uniq<MyOrNode>(std::move(left), std::move(right)));
+        } else {
+            assert(0);
+        }
+    };
+
+    unsigned i = 0;
+    while (i < tokens.size()) {
+        const std::string& token = tokens[i];
+
+        if (token == "(") {
+            ops.push_back(token);
+        } else if (token == ")") {
+            while (!ops.empty() && ops.back() != "(") {
+                applyOperator();
+            }
+            ops.pop_back(); // Remove '('
+        } else if (token == "AND" || token == "OR") {
+            while (!ops.empty() && ops.back() != "(") {
+                applyOperator();
+            }
+            ops.push_back(token);
+        } else {
+            assert(i + 2 < tokens.size());
+            assert(i + 1 < tokens.size());
+
+            if (tokens[i + 1] == "=") {
+                values.push_back(make_uniq<PredicateNode>(tokens[i], tokens[i + 1], std::stoi(tokens[i + 2])));
+                i += 2;
+            } else if (tokens[i + 1] == "&") {
+                assert(ops.back() == "(");
+                ops.pop_back();
+                values.push_back(make_uniq<PredicateNode>(tokens[i], "&", std::stoi(tokens[i + 2])));
+                i += 5;
+            } else {
+                assert(0);
+            }
+        }
+        ++i;
+    }
+
+    while (!ops.empty()) {
+        applyOperator();
+    }
+
+    return values.empty() ? nullptr : std::move(values.back());
+}
+
 bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, LogicalOperator &input_op,
                                            vector<reference<LogicalOperator>> &filter_operators,
                                            optional_ptr<LogicalOperator> parent) {
 	optional_ptr<LogicalOperator> op = &input_op;
 	vector<reference<LogicalOperator>> datasource_filters;
 	optional_ptr<LogicalOperator> limit_op = nullptr;
+
+	// Check for parachute option.
+	auto parachute_stats_file = ClientConfig::GetSetting<ParachuteStatsSetting>(context);
+	auto parachute_stats = ClientConfig::GetConfig(context).GetParachuteStats();
+	bool use_parachute = (!parachute_stats_file.empty());
+
 	// pass through single child operators
 	while (op->children.size() == 1 && !OperatorNeedsRelation(op->type)) {
 		if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -237,8 +437,36 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		auto combined_stats = RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(*op, children_stats);
 		op->SetEstimatedCardinality(combined_stats.cardinality);
 		if (!datasource_filters.empty()) {
-			combined_stats.cardinality = (idx_t)MaxValue(
-			    double(combined_stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			// Check if we have filters on parachute columns.
+			// NOTE: We hack the mark-join to be able to recognize this.
+			bool has_non_parachute_filter = false;
+			if (datasource_filters.size() == 1) {
+				for (const auto& filter : datasource_filters) {
+					LogicalOperator& op = filter.get();
+					assert(op.GetName() == "FILTER");
+
+					for (const auto& expr : op.expressions) {
+						// Take the string representation.
+						auto expr_str = expr->ToString();
+
+						// A parachute `IN`?
+						if (starts_with3(expr_str, "PARACHUTE_IN")) {
+							D_ASSERT(expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF);
+
+							// TODO: Take the `IN`-list.
+						} else {
+							has_non_parachute_filter = true;
+						}
+					}
+				}
+			} else {
+				D_ASSERT(0);
+			}
+
+			// Only estimate as in DuckDB v1.2.0 if we have a non-parachute filter.
+			if (has_non_parachute_filter) {
+				combined_stats.cardinality = (idx_t)MaxValue(double(combined_stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			}
 		}
 		AddRelation(input_op, parent, combined_stats);
 		return true;
@@ -348,13 +576,107 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 	case LogicalOperatorType::LOGICAL_GET: {
 		// TODO: Get stats from a logical GET
 		auto &get = op->Cast<LogicalGet>();
+
+		// TODO: I mean, we could push them here, right? At least for cardinality estimation.
 		auto stats = RelationStatisticsHelper::ExtractGetStats(get, context);
 		// if there is another logical filter that could not be pushed down into the
 		// table scan, apply another selectivity.
 		get.SetEstimatedCardinality(stats.cardinality);
+
+		// Get the table name.
+		auto table_name = stats.table_name;
+
+		auto count_token = [&](const string& text, const string token) {
+			size_t ret = 0;
+			size_t loc = text.find(token);
+			while (loc != string::npos) {
+				++ret;
+				loc = text.find(token, loc + 1);
+			}
+			return ret;
+		};
+
 		if (!datasource_filters.empty()) {
-			stats.cardinality =
-			    (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			bool has_non_parachute_filter = false;
+			double custom_sel = 1.0;
+			if (datasource_filters.size() == 1) {
+				bool only_once = false;
+				for (const auto& filter : datasource_filters) {
+					LogicalOperator& op = filter.get();
+					D_ASSERT(op.GetName() == "FILTER");
+
+					for (const auto& expr : op.expressions) {
+						// Take the string representation.
+						auto expr_str = expr->ToString();
+
+						// std::cerr << "[LOGICAL_GET] " << expr_str << std::endl;
+
+						// Count `AND` and `OR`.
+						auto sep_count = count_token(expr_str, " AND ") + count_token(expr_str, " OR ");
+
+						// std::cerr << "\tsep_count=" << sep_count << std::endl;
+
+						// Count the number of parachute columns.
+						auto parachute_count = count_token(expr_str, "parachute_");
+
+						// std::cerr << "\tparachute_count=" << parachute_count << std::endl;
+
+						// Full house?
+						if (sep_count == parachute_count - 1) {
+							D_ASSERT(!only_once);
+							only_once = true;
+
+							// No stats? Then skip.
+							if (parachute_stats.empty()) {
+								continue;
+							}
+
+							// Parse the expression.
+							auto ast = my_expression_parser(expr_str);
+
+							std::cerr << "built ast" << std::endl;
+
+							// And evaluate it based on the parachute stats.
+							custom_sel = ast->evaluate(table_name, parachute_stats);
+
+
+							std::cerr << "custom_sel=" << custom_sel << std::endl;
+						} else if (parachute_count) {
+							// This should never happen.
+							D_ASSERT(0);
+						} else {
+							has_non_parachute_filter = true;
+						}
+					}
+				}
+			} else {
+				D_ASSERT(0);
+			}
+
+			// Only estimate as in DuckDB v1.2.0 if we have a non-parachute column.
+			if (!use_parachute) {
+				if (has_non_parachute_filter) {
+					stats.cardinality = (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+				} else {
+					// noop.
+				}
+			} else {
+				// Do we have a non-parachute column (even if we use parachute)?
+				if (has_non_parachute_filter) {
+					stats.cardinality = (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);	
+				} else {
+					// Otherwise, estimate the parachute column.
+					if (parachute_stats.empty()) {
+						// Use the default DuckDB v1.2.0 optimizer.
+						stats.cardinality = (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+					} else {
+						// Use our optimizer.
+						// TODO: Skip this if we artificially pushed it, i.e., if we indeed have `parachute_stats`.
+						std::cerr << "######## SHOULD BE HERE" << std::endl;
+						stats.cardinality = (idx_t)MaxValue(double(stats.cardinality) * custom_sel, (double)1);
+					}
+				}
+			}
 		}
 		ModifyStatsIfLimit(limit_op.get(), stats);
 		AddRelation(input_op, parent, stats);

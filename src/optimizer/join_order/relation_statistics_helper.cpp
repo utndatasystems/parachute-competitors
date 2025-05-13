@@ -9,6 +9,8 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 
+#include <regex>
+
 namespace duckdb {
 
 static ExpressionBinding GetChildColumnBinding(Expression &expr) {
@@ -52,6 +54,13 @@ static ExpressionBinding GetChildColumnBinding(Expression &expr) {
 	return ret;
 }
 
+bool starts_with1(std::string text, std::string pattern) {
+	int text_len = text.size();
+	int pattern_len = pattern.size();
+	if (text_len < pattern_len) return false;
+	return text.compare(0, pattern_len, pattern) == 0;
+}
+
 RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
 	auto return_stats = RelationStats();
 
@@ -76,11 +85,24 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		have_catalog_table_statistics = true;
 	}
 
+	// Check if we are allowed to use parachutes or not.
+	auto parachute_stats_file = ClientConfig::GetSetting<ParachuteStatsSetting>(context);
+	bool use_parachute = (!parachute_stats_file.empty());
+
 	// first push back basic distinct counts for each column (if we have them).
 	auto &column_ids = get.GetColumnIds();
 	for (idx_t i = 0; i < column_ids.size(); i++) {
 		auto column_id = column_ids[i].GetPrimaryIndex();
 		bool have_distinct_count_stats = false;
+
+		// Should we disallow parachutes?
+		if (!use_parachute) {
+			// Skip if parachute column (and if `column_id` is valid, of course).
+			if ((column_id < get.names.size()) && (starts_with1(get.names.at(column_id), "parachute_"))) {
+				continue;
+			}
+		}
+
 		if (get.function.statistics) {
 			column_statistics = get.function.statistics(context, get.bind_data.get(), column_id);
 			if (column_statistics && have_catalog_table_statistics) {
@@ -105,7 +127,21 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		}
 	}
 
+	std::string table_name = "dummy_table";
+	if (get.GetTable()) {
+		table_name = get.GetTable()->name;
+	}
+
+	// Get the parachute stats.	
+	auto parachute_stats = ClientConfig::GetConfig(context).GetParachuteStats();
+
+	// Count the number of parachute filters.
+	unsigned parachute_filter_count = 0;
+
+	// std::cerr << "\ntable_name=" << table_name << std::endl;
+
 	if (!get.table_filters.filters.empty()) {
+		bool has_supported_filter = false;
 		column_statistics = nullptr;
 		bool has_non_optional_filters = false;
 		for (auto &it : get.table_filters.filters) {
@@ -113,24 +149,102 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 				column_statistics = get.function.statistics(context, get.bind_data.get(), it.first);
 			}
 
+			// Take the column name.
+			std::string column_name = "dummy_column";
+			if (get.GetTable()) {
+				column_name = get.GetTable()->GetColumn(LogicalIndex(it.first)).Name();
+			}
+
+			// std::cerr << "--- column_name=" << column_name << std::endl;
+
+			// Check if it's a parachute column.
+			auto is_parachute_col = starts_with1(column_name, "parachute_");
+
+			// Increment the number of parachute columns (if the case).
+			parachute_filter_count += is_parachute_col;
+
 			if (column_statistics) {
-				idx_t cardinality_with_filter =
-				    InspectTableFilter(base_table_cardinality, it.first, *it.second, *column_statistics);
+				// std::cerr << "************ HAS COLUMN STATISTICS *************" << std::endl;
+				// std::cerr << "IS IT OPTOINAL????? " << (it.second->filter_type == TableFilterType::OPTIONAL_FILTER) << std::endl;
+
+				idx_t cardinality_with_filter = cardinality_after_filters;
+				if (is_parachute_col) {
+					if (use_parachute) {
+						// Is the data empty? Then we have to use the default optimized.
+						if (parachute_stats.empty()) {
+							// Use the default estimation from DuckDB v1.2.0 (see also below).
+							cardinality_with_filter = InspectTableFilter(base_table_cardinality, it.first, *it.second, *column_statistics, has_supported_filter);
+						} else {
+							// Otherwise, use our estimates.
+							// TODO: Maybe we should have a not-supported?
+							cardinality_with_filter = InspectParachuteFilter(parachute_stats, base_table_cardinality, it.first, *it.second, table_name, column_name, *column_statistics);
+							// std::cerr << "after ==> " << cardinality_with_filter << std::endl;
+						}
+					} else {
+						// Don't even try to estimate.
+					}
+				} else {
+					cardinality_with_filter = InspectTableFilter(base_table_cardinality, it.first, *it.second, *column_statistics, has_supported_filter);
+				}
+
+				// Take the minimum cardinality.
+				// std::cerr << "[===>ovie] cardinality_with_filter=" << cardinality_with_filter << std::endl;
 				cardinality_after_filters = MinValue(cardinality_after_filters, cardinality_with_filter);
 			}
 
 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
-				has_non_optional_filters = true;
+				if (is_parachute_col) {
+					// Are we allowed to use parachutes?
+					if (use_parachute) {
+						// Make the differentiation of whether we use our estimates or not.
+						if (parachute_stats.empty()) {
+							has_non_optional_filters = true;
+						} else {
+							// NOTE: We can estimate all our parachute columns.
+							// noop.
+						}
+					} else {
+						// noop.
+					}
+				} else {
+					has_non_optional_filters = true;	
+				}
 			}
 		}
+
+		// std::cerr << "has_supported_filter=" << has_supported_filter << " has_non_optional_filter=" << has_non_optional_filters << std::endl;
+		// std::cerr << "parachute_filter_count=" << parachute_filter_count << " filters.size()=" << get.table_filters.filters.size() << std::endl;
+
 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
 		// and there are other table filters (i.e cost > 50), use default selectivity.
+		// TODO: This is wrong in DuckDB v1.2.0, since the cardinality _can_ still be the base one.
+		// NOTE: The below is just to estimate the cardinality of the unsupported filters!
 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
-		if (!has_equality_filter && has_non_optional_filters) {
-			cardinality_after_filters = MaxValue<idx_t>(
-			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
-			    1U);
+		if ((!use_parachute) && (!parachute_filter_count)) {
+			if ((!has_equality_filter) && (has_non_optional_filters)) {
+				// DuckDB v1.2.0.
+				cardinality_after_filters = MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY), 1U);
+			}
+		} else if ((!use_parachute) && (parachute_filter_count)) {
+			if (parachute_filter_count == get.table_filters.filters.size()) {
+				// noop.
+			} else {
+				if ((!has_equality_filter) && (has_non_optional_filters)) {
+					// DuckDB v1.2.0.
+					cardinality_after_filters = MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY), 1U);
+				}
+			}
+		} else if ((use_parachute) && (parachute_stats.empty())) {
+			// We are allowed to use parachutes, but the stats are empty, i.e., we use the default DuckDB optimizer.
+			if ((!has_equality_filter) && (has_non_optional_filters)) {
+				// DuckDB v1.2.0.
+				cardinality_after_filters = MaxValue<idx_t>(LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY), 1U);
+			}
+		} else {
+			D_ASSERT((use_parachute) && (!parachute_stats.empty()));
+			// Let's keep this as is. Using the default selectivity is anyway bad.
 		}
+
 		if (base_table_cardinality == 0) {
 			cardinality_after_filters = 0;
 		}
@@ -378,15 +492,188 @@ RelationStats RelationStatisticsHelper::ExtractEmptyResultStats(LogicalEmptyResu
 	return stats;
 }
 
+
+std::string TableFilterTypeToString(TableFilterType type) {
+	switch (type) {
+		case TableFilterType::CONSTANT_COMPARISON: return "CONSTANT_COMPARISON";
+		case TableFilterType::IS_NULL: return "IS_NULL";
+		case TableFilterType::IS_NOT_NULL: return "IS_NOT_NULL";
+		case TableFilterType::CONJUNCTION_OR: return "CONJUNCTION_OR";
+		case TableFilterType::CONJUNCTION_AND: return "CONJUNCTION_AND";
+		case TableFilterType::STRUCT_EXTRACT: return "STRUCT_EXTRACT";
+		case TableFilterType::OPTIONAL_FILTER: return "OPTIONAL_FILTER";
+		case TableFilterType::IN_FILTER: return "IN_FILTER";
+		case TableFilterType::DYNAMIC_FILTER: return "DYNAMIC_FILTER";
+		default: return "UNKNOWN";
+	}
+}
+
+std::vector<std::string> parse_in_clause(const std::string& pred, const std::string& pred_col) {
+    // Construct regex pattern to match the "IN" clause without single quotes around values
+    std::string re_str = "\\b" + pred_col + "\\s*(IN)\\s*\\(\\s*([^\\)]+)\\s*\\)";
+    
+    // Create regex object
+    std::regex re(re_str, std::regex_constants::icase);
+    std::smatch match;
+    std::vector<std::string> values;
+
+    if (std::regex_search(pred, match, re)) {
+        // Extract the part inside the parentheses (values without quotes)
+        std::string values_str = match.str(2);  // Capture group 2 contains the values
+
+        // Regex to match individual numbers or strings (without quotes)
+        std::regex value_re("\\s*(\\d+)\\s*");
+        auto values_begin = std::sregex_iterator(values_str.begin(), values_str.end(), value_re);
+        auto values_end = std::sregex_iterator();
+        
+        for (auto it = values_begin; it != values_end; ++it) {
+            values.push_back(it->str(1));  // Capture the number or string without quotes
+        }
+    }
+    return values;
+}
+
+idx_t RelationStatisticsHelper::InspectParachuteFilter(ParachuteStats& parachute_stats, idx_t cardinality, idx_t column_index,  TableFilter &filter, std::string tab_name, std::string col_name, BaseStatistics &base_stats) {
+	auto cardinality_after_filters = cardinality;
+	
+	// std::cerr << "[InspectParachuteFilter] tn=" << tab_name << " cn=" << col_name << std::endl;
+
+	// Don't estimate optional parachute filters.
+	// NOTE: We might still estimate them from the artificially pushed filters.
+	if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+		return cardinality_after_filters;
+	}
+
+	// std::cerr << "filter_type=" << TableFilterTypeToString(filter.filter_type) << std::endl;
+	// std::cerr << "filter=" << filter.ToString(col_name) << std::endl;
+
+	auto count_token = [&](const string& text, const string token) {
+		size_t ret = 0;
+		size_t loc = text.find(token);
+		while (loc != string::npos) {
+			++ret;
+			loc = text.find(token, loc + 1);
+		}
+		return ret;
+	};
+
+	if (filter.filter_type == TableFilterType::CONJUNCTION_AND) {
+		// Skip if no stats.
+		if (!parachute_stats.has(tab_name, col_name))
+			return cardinality_after_filters;
+
+		// To string.
+		auto filter_str = filter.ToString(col_name);
+
+		// TODO: Match `col_name op1 val1 AND col_name op2 val2`.
+		// Example: `parachute_my_col >= 3 AND parachute_my_col <= 5`.
+    std::regex regex_str(R"((\w+)\s*(>=|<=|>|<|=|!=)\s*(\d+)\s+AND\s+\1\s*(>=|<=|>|<|=|!=)\s*(\d+))");
+    std::smatch match;
+
+    if (std::regex_match(filter_str, match, regex_str)) {
+			D_ASSERT(col_name == match[1]);
+			std::string op1 = match[2];
+			uint64_t val1 = std::stoull(match[3]);
+			std::string op2 = match[4];
+			uint64_t val2 = std::stoull(match[5]);
+
+			// std::cerr << "Match found!\n";
+			// std::cerr << "col_name: " << col_name << "\n";
+			// std::cerr << "op1: " << op1 << ", val1: " << val1 << "\n";
+			// std::cerr << "op2: " << op2 << ", val2: " << val2 << "\n";
+				
+			D_ASSERT((!op1.empty()) && (!op2.empty()));
+			if ((op1 == ">=") && (op2 == "<=")) {
+				// Compute the range cardinality for [val1, val2] (:= [val1, val2 + 1[).
+				auto range_card = parachute_stats.compute_range_card(tab_name, col_name, val1, val2 + 1);
+				auto full_card = parachute_stats.compute_full_card(tab_name, col_name);
+				auto sel = 1.0 * range_card / full_card;
+				return static_cast<idx_t>(sel * cardinality_after_filters);
+			}
+		}
+
+		D_ASSERT(0);
+
+		// Default.
+		return cardinality_after_filters;
+	} else if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+		auto &comparison_filter = filter.Cast<ConstantFilter>();
+
+		// Take the value.
+		auto val = comparison_filter.constant.GetValue<uint32_t>();
+
+		// std::cerr << "\t[CONSTANT_COMPARISON] val=" << val << std::endl;
+
+		// TODO: Don't return if we have multiple filters (later).
+		if (!parachute_stats.has(tab_name, col_name))
+			return cardinality_after_filters;
+
+		std::string op;
+		if (comparison_filter.comparison_type == ExpressionType::COMPARE_EQUAL) {
+			op = "=";
+		} else if (comparison_filter.comparison_type == ExpressionType::COMPARE_NOTEQUAL) {
+			op = "!=";
+		} else if (comparison_filter.comparison_type == ExpressionType::COMPARE_LESSTHAN) {
+			op = "<";
+		} else if (comparison_filter.comparison_type == ExpressionType::COMPARE_LESSTHANOREQUALTO) {
+			op = "<=";
+		} else if (comparison_filter.comparison_type == ExpressionType::COMPARE_GREATERTHAN) {
+			op = ">";
+		} else if (comparison_filter.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO) {
+			op = ">=";
+		}
+
+		// std::cerr << "\t[CONSTANT_COMPARISON] op=" << op << std::endl;
+
+		if (!op.empty()) {
+			auto sel = parachute_stats.compute_selectivity(tab_name, col_name, op, val);
+			// std::cerr << "[" << col_name << " " << op << " " << val << "]: sel=" << sel << std::endl;
+			return static_cast<idx_t>(sel * cardinality_after_filters);
+		}
+
+		// std::cerr << "not found!" << std::endl;
+		// std::cerr << "filter_str=" << comparison_filter.ToString(col_name) << std::endl;
+
+		// Default.
+		return cardinality_after_filters;
+	} else {
+		// Filter to string.
+		auto filter_str = filter.ToString(col_name);
+
+		// Do we have an IN-clause?
+		if (count_token(filter_str, " IN ")) {
+			auto values = parse_in_clause(filter_str, col_name);
+
+			// Cumulate the total selectivity by using an equality.
+			double total_sel = 0;
+			for (auto val : values) {
+				auto sel = parachute_stats.compute_selectivity(tab_name, col_name, "=", std::stoull(val));
+				total_sel += sel;
+			}
+			// std::cerr << filter_str << ": sel=" << total_sel << std::endl;
+			return static_cast<idx_t>(total_sel * cardinality_after_filters);
+		}
+
+		// std::cerr << "filter_str=" << filter_str << std::endl;
+		D_ASSERT(0);
+
+		// Default.
+		return cardinality_after_filters;
+	}
+
+	// Unreachable.
+	D_ASSERT(0);
+}
+
 idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t column_index, TableFilter &filter,
-                                                   BaseStatistics &base_stats) {
+                                                   BaseStatistics &base_stats, bool &has_supported_filter) {
 	auto cardinality_after_filters = cardinality;
 	switch (filter.filter_type) {
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &and_filter = filter.Cast<ConjunctionAndFilter>();
 		for (auto &child_filter : and_filter.child_filters) {
 			cardinality_after_filters = MinValue(
-			    cardinality_after_filters, InspectTableFilter(cardinality, column_index, *child_filter, base_stats));
+			    cardinality_after_filters, InspectTableFilter(cardinality, column_index, *child_filter, base_stats, has_supported_filter));
 		}
 		return cardinality_after_filters;
 	}
@@ -395,12 +682,17 @@ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t colu
 		if (comparison_filter.comparison_type != ExpressionType::COMPARE_EQUAL) {
 			return cardinality_after_filters;
 		}
+
+		// Mark as supported.
+		has_supported_filter = true;
+
 		auto column_count = base_stats.GetDistinctCount();
 		// column_count = 0 when there is no column count (i.e parquet scans)
 		if (column_count > 0) {
 			// we want the ceil of cardinality/column_count. We also want to avoid compiler errors
 			cardinality_after_filters = (cardinality + column_count - 1) / column_count;
 		}
+		// TODO: Shouldn't here be zero?
 		return cardinality_after_filters;
 	}
 	default:
