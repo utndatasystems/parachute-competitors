@@ -327,21 +327,6 @@ bool RelationManager::ExtractJoinRelations(LogicalOperator &input_op,
 				} else {
 					// noop.
 				}
-			} else {
-				// Do we have a non-parachute column (even if we use parachute)?
-				if (has_non_parachute_filter) {
-					stats.cardinality =
-			    	(idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
-				} else {
-					// Otherwise, estimate the parachute column.
-					if (true /* parachute_stats.empty() */) {
-						// Use the default DuckDB v0.9.2 optimizer.
-						stats.cardinality =
-			    		(idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
-					} else {
-						D_ASSERT(0);
-					}
-				}
 			}
 		}
 

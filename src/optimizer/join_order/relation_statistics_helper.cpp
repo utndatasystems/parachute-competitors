@@ -131,6 +131,9 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 
 	if (!get.table_filters.filters.empty()) {
 		column_statistics = nullptr;
+
+		std::cerr << "====" << std::endl;
+		std::cerr << "[ExtractGetStats] cardinality_before_filters=" << cardinality_after_filters << std::endl;
 		for (auto &it : get.table_filters.filters) {
 			if (get.bind_data && get.function.name.compare("seq_scan") == 0) {
 				auto &table_scan_bind_data = get.bind_data->Cast<TableScanBindData>();
@@ -143,6 +146,7 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 				column_name = get.GetTable()->GetColumn(LogicalIndex(it.first)).Name();
 			}
 
+			std::cerr << "--- table_name=" << table_name << std::endl;
 			std::cerr << "--- column_name=" << column_name << std::endl;
 
 			// Check if it's a parachute column.
@@ -151,31 +155,53 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 			// Increment the number of parachute columns (if the case).
 			parachute_filter_count += is_parachute_col;
 
+			std::cerr << "--- is_parachute_col=" << is_parachute_col << std::endl;
+
 			// TODO: So we never estimate single-column filters?
 			if (column_statistics && it.second->filter_type == TableFilterType::CONJUNCTION_AND) {
-				auto &filter = it.second->Cast<ConjunctionAndFilter>();
-				idx_t cardinality_with_and_filter = RelationStatisticsHelper::InspectConjunctionAND(
+				std::cerr << "[ExtractGetStats] >>> enters here?" << std::endl;
+
+				idx_t cardinality_with_and_filter = cardinality_after_filters;
+				if (is_parachute_col) {
+					// noop
+				} else {
+					// Use the default estimation from DuckDB v0.9.2.
+					auto &filter = it.second->Cast<ConjunctionAndFilter>();
+					cardinality_with_and_filter = RelationStatisticsHelper::InspectConjunctionAND(
 				    base_table_cardinality, it.first, filter, *column_statistics);
+				}
+
+				// Take the minimum cardinality.
 				cardinality_after_filters = MinValue(cardinality_after_filters, cardinality_with_and_filter);
 			}
 
 			std::cerr << "[ExtractGetStats] cardinality_after_filters=" << cardinality_after_filters << std::endl;
+			std::cerr << "()()()()" << std::endl;
 		}
 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
 		// and there are other table filters (i.e cost > 50), use default selectivity.
 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
 
 		if ((!use_parachute) && (!parachute_filter_count)) {
+			std::cerr << "[*]" << std::endl;
 			if ((!has_equality_filter) && (!get.table_filters.filters.empty())) {
+				std::cerr << "[*] intra &&& duckdb" << std::endl;
+
 				// DuckDB v0.9.2.
 				cardinality_after_filters =
 			    MaxValue<idx_t>(base_table_cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, 1);
 			}
 		} else if ((!use_parachute) && (parachute_filter_count)) {
+			std::cerr << "[**]" << std::endl;
+
 			if (parachute_filter_count == get.table_filters.filters.size()) {
+				std::cerr << "[**] boom" << std::endl;
+
 				// noop.
 			} else {
 				if ((!has_equality_filter) && (!get.table_filters.filters.empty())) {
+					std::cerr << "[**] intra &&& duckdb" << std::endl;
+
 					// DuckDB v0.9.2.
 					cardinality_after_filters =
 			    	MaxValue<idx_t>(base_table_cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, 1);
@@ -192,6 +218,9 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 			D_ASSERT((use_parachute) && (false /* !parachute_stats.empty() */));
 			// Let's keep this as is. Using the default selectivity is anyway bad.
 		}
+
+		std::cerr << "[ExtractGetStats] AFTER ALL: " << cardinality_after_filters << std::endl;
+		std::cerr << "====" << std::endl;
 
 		if (base_table_cardinality == 0) {
 			cardinality_after_filters = 0;
