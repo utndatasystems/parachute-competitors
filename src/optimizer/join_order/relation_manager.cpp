@@ -12,6 +12,13 @@
 
 namespace duckdb {
 
+bool starts_with3(std::string text, std::string pattern) {
+	int text_len = text.size();
+	int pattern_len = pattern.size();
+	if (text_len < pattern_len) return false;
+	return text.compare(0, pattern_len, pattern) == 0;
+}
+
 const vector<RelationStats> RelationManager::GetRelationStats() {
 	vector<RelationStats> ret;
 	for (idx_t i = 0; i < relations.size(); i++) {
@@ -168,8 +175,37 @@ bool RelationManager::ExtractJoinRelations(LogicalOperator &input_op,
 
 		auto combined_stats = RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(*op, children_stats);
 		if (!datasource_filters.empty()) {
-			combined_stats.cardinality =
+			// Check if we have filters on parachute columns.
+			// NOTE: We hack the mark-join to be able to recognize this.
+			bool has_non_parachute_filter = false;
+			if (datasource_filters.size() == 1) {
+				for (const auto& filter : datasource_filters) {
+					LogicalOperator& op = filter.get();
+					assert(op.GetName() == "FILTER");
+
+					for (const auto& expr : op.expressions) {
+						// Take the string representation.
+						auto expr_str = expr->ToString();
+
+						// A parachute `IN`?
+						if (starts_with3(expr_str, "PARACHUTE_IN")) {
+							D_ASSERT(expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF);
+
+							// TODO: Take the `IN`-list.
+						} else {
+							has_non_parachute_filter = true;
+						}
+					}
+				}
+			} else {
+				D_ASSERT(0);
+			}
+
+			// Only estimate as in DuckDB v0.9.2 if we have a non-parachute filter.
+			if (has_non_parachute_filter) {
+				combined_stats.cardinality =
 			    (idx_t)MaxValue(combined_stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			}
 		}
 		AddRelation(input_op, parent, combined_stats);
 		return true;
@@ -221,12 +257,94 @@ bool RelationManager::ExtractJoinRelations(LogicalOperator &input_op,
 		// TODO: Get stats from a logical GET
 		auto &get = op->Cast<LogicalGet>();
 		auto stats = RelationStatisticsHelper::ExtractGetStats(get, context);
-		// if there is another logical filter that could not be pushed down into the
-		// table scan, apply another selectivity.
+
+		bool use_parachute = false;
+
+		// Get the table name.
+		auto table_name = stats.table_name;
+
+		auto count_token = [&](const string& text, const string token) {
+			size_t ret = 0;
+			size_t loc = text.find(token);
+			while (loc != string::npos) {
+				++ret;
+				loc = text.find(token, loc + 1);
+			}
+			return ret;
+		};
+
 		if (!datasource_filters.empty()) {
-			stats.cardinality =
-			    (idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			bool has_non_parachute_filter = false;
+			double custom_sel = 1.0;
+			if (datasource_filters.size() == 1) {
+				bool only_once = false;
+				for (const auto& filter : datasource_filters) {
+					LogicalOperator& op = filter.get();
+					D_ASSERT(op.GetName() == "FILTER");
+
+					for (const auto& expr : op.expressions) {
+						// Take the string representation.
+						auto expr_str = expr->ToString();
+
+						// std::cerr << "[LOGICAL_GET] " << expr_str << std::endl;
+
+						// Count `AND` and `OR`.
+						auto sep_count = count_token(expr_str, " AND ") + count_token(expr_str, " OR ");
+
+						// std::cerr << "\tsep_count=" << sep_count << std::endl;
+
+						// Count the number of parachute columns.
+						auto parachute_count = count_token(expr_str, "parachute_");
+
+						// std::cerr << "\tparachute_count=" << parachute_count << std::endl;
+
+						// Full house?
+						if (sep_count == parachute_count - 1) {
+							D_ASSERT(!only_once);
+							only_once = true;
+
+							// No stats? Then skip.
+							if (true /* parachute_stats.empty() */) {
+								continue;
+							}
+						} else if (parachute_count) {
+							// This should never happen.
+							D_ASSERT(0);
+						} else {
+							has_non_parachute_filter = true;
+						}
+					}
+				}
+			} else {
+				D_ASSERT(0);
+			}
+
+			// Only estimate as in DuckDB v0.9.2 if we have a non-parachute column.
+			if (!use_parachute) {
+				if (has_non_parachute_filter) {
+					stats.cardinality =
+			    	(idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+				} else {
+					// noop.
+				}
+			} else {
+				// Do we have a non-parachute column (even if we use parachute)?
+				if (has_non_parachute_filter) {
+					stats.cardinality =
+			    	(idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+				} else {
+					// Otherwise, estimate the parachute column.
+					if (true /* parachute_stats.empty() */) {
+						// Use the default DuckDB v0.9.2 optimizer.
+						stats.cardinality =
+			    		(idx_t)MaxValue(stats.cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+					} else {
+						D_ASSERT(0);
+					}
+				}
+			}
 		}
+
 		AddRelation(input_op, parent, stats);
 		return true;
 	}

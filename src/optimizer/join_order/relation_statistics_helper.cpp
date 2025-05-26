@@ -9,6 +9,8 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 
+#include <iostream>
+
 namespace duckdb {
 
 static ExpressionBinding GetChildColumnBinding(Expression &expr) {
@@ -52,6 +54,13 @@ static ExpressionBinding GetChildColumnBinding(Expression &expr) {
 	return ret;
 }
 
+bool starts_with1(std::string text, std::string pattern) {
+	int text_len = text.size();
+	int pattern_len = pattern.size();
+	if (text_len < pattern_len) return false;
+	return text.compare(0, pattern_len, pattern) == 0;
+}
+
 RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientContext &context) {
 	auto return_stats = RelationStats();
 
@@ -76,9 +85,21 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		have_catalog_table_statistics = true;
 	}
 
+	bool use_parachute = false;
+
 	// first push back basic distinct counts for each column (if we have them).
 	for (idx_t i = 0; i < get.column_ids.size(); i++) {
+		auto column_id = get.column_ids[i];
 		bool have_distinct_count_stats = false;
+
+		// Should we disallow parachutes?
+		if (!use_parachute) {
+			// Skip if parachute column (and if `column_id` is valid, of course).
+			if ((column_id < get.names.size()) && (starts_with1(get.names.at(column_id), "parachute_"))) {
+				continue;
+			}
+		}
+
 		if (get.function.statistics) {
 			column_statistics = get.function.statistics(context, get.bind_data.get(), get.column_ids[i]);
 			if (column_statistics && have_catalog_table_statistics) {
@@ -102,6 +123,12 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		}
 	}
 
+	// Set the table name.
+	std::string table_name = name;
+
+	// Count the number of parachute filters.
+	unsigned parachute_filter_count = 0;
+
 	if (!get.table_filters.filters.empty()) {
 		column_statistics = nullptr;
 		for (auto &it : get.table_filters.filters) {
@@ -110,20 +137,62 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 				column_statistics = get.function.statistics(context, &table_scan_bind_data, it.first);
 			}
 
+			// Take the column name.
+			std::string column_name = "dummy_column";
+			if (get.GetTable()) {
+				column_name = get.GetTable()->GetColumn(LogicalIndex(it.first)).Name();
+			}
+
+			std::cerr << "--- column_name=" << column_name << std::endl;
+
+			// Check if it's a parachute column.
+			auto is_parachute_col = starts_with1(column_name, "parachute_");
+
+			// Increment the number of parachute columns (if the case).
+			parachute_filter_count += is_parachute_col;
+
+			// TODO: So we never estimate single-column filters?
 			if (column_statistics && it.second->filter_type == TableFilterType::CONJUNCTION_AND) {
 				auto &filter = it.second->Cast<ConjunctionAndFilter>();
 				idx_t cardinality_with_and_filter = RelationStatisticsHelper::InspectConjunctionAND(
 				    base_table_cardinality, it.first, filter, *column_statistics);
 				cardinality_after_filters = MinValue(cardinality_after_filters, cardinality_with_and_filter);
 			}
+
+			std::cerr << "[ExtractGetStats] cardinality_after_filters=" << cardinality_after_filters << std::endl;
 		}
 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
 		// and there are other table filters (i.e cost > 50), use default selectivity.
 		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
-		if (!has_equality_filter && !get.table_filters.filters.empty()) {
-			cardinality_after_filters =
+
+		if ((!use_parachute) && (!parachute_filter_count)) {
+			if ((!has_equality_filter) && (!get.table_filters.filters.empty())) {
+				// DuckDB v0.9.2.
+				cardinality_after_filters =
 			    MaxValue<idx_t>(base_table_cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, 1);
+			}
+		} else if ((!use_parachute) && (parachute_filter_count)) {
+			if (parachute_filter_count == get.table_filters.filters.size()) {
+				// noop.
+			} else {
+				if ((!has_equality_filter) && (!get.table_filters.filters.empty())) {
+					// DuckDB v0.9.2.
+					cardinality_after_filters =
+			    	MaxValue<idx_t>(base_table_cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, 1);
+				}
+			}
+		} else if ((use_parachute) && (true /* parachute_stats.empty() */)) {
+			// We are allowed to use parachutes, but the stats are empty, i.e., we use the default DuckDB optimizer.
+			if ((!has_equality_filter) && (!get.table_filters.filters.empty())) {
+				// DuckDB v0.9.2.
+				cardinality_after_filters =
+					MaxValue<idx_t>(base_table_cardinality * RelationStatisticsHelper::DEFAULT_SELECTIVITY, 1);
+			}
+		} else {
+			D_ASSERT((use_parachute) && (false /* !parachute_stats.empty() */));
+			// Let's keep this as is. Using the default selectivity is anyway bad.
 		}
+
 		if (base_table_cardinality == 0) {
 			cardinality_after_filters = 0;
 		}
